@@ -36,6 +36,29 @@ python pdf_goat.py /path/to/file.pdf --dry-run
 python pdf_goat.py /path/to/folder --dry-run
 ```
 
+## Worked example
+
+A community foundation receives 40 grant reports as scanned PDFs.
+Some are clean text; some are image-only scans of faxed forms.
+
+```bash
+# Dry run to classify pages and preview chunk counts
+python pdf_goat.py ./grant_reports/ --dry-run
+
+# Full run: extract, chunk, embed, upsert to Supabase
+python pdf_goat.py ./grant_reports/ \
+  --table document_embeddings \
+  --batch-label "grant_reports_fy24"
+```
+
+The pipeline will:
+- Hash each file and skip duplicates
+- Route image-only pages through Claude Vision
+- Chunk each document at ~1,500 characters with 150-character overlap
+- Write a provenance manifest so you know exactly which pages were vision-processed vs. text-extracted
+
+Other document types that work well: board minutes, bylaws, annual reports, program evaluations, RFP responses.
+
 ## Public version note
 
 This repo is the sanitized public version.
