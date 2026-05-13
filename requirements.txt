@@ -1,0 +1,5 @@
+pdfplumber
+python-dotenv
+openai
+requests
+supabase
