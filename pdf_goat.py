@@ -7,24 +7,27 @@ pdf_goat.
 
 Pipeline (12 steps):
   1. Hash + dedupe (SHA256 — skip if already in manifest)
-  2. Text extraction (pdfplumber)
+  2. Text extraction (Docling — pdfplumber fallback)
   3. Page classification (text_only / text_with_images / image_only / empty)
-  4. Table extraction (pdfplumber tables)
+  4. Table extraction (Docling TableFormer — pdfplumber fallback)
   5. Vision routing (image_only → full_vision, mixed → page_vision)
   6. Claude Vision extraction (for flagged pages)
   7. Merge text + vision output per page
   8. Preprocess (chunking.preprocess_text)
   9. Chunk (chunking.chunk_text — v2 recursive)
  10. Embed (text-embedding-3-large @ 1536d)
- 11. Optional upsert to Supabase (configurable table, on_conflict)
+ 11. Upsert to Supabase (sailing_embeddings, on_conflict)
  12. Write manifest row (local CSV)
 
 Usage:
   # Single file
   python pdf_goat.py /path/to/doc.pdf
 
-  # Directory (process all PDFs)
+    # Directory (process PDFs recursively)
   python pdf_goat.py /path/to/staging/
+
+    # Explicit ingest command
+    python pdf_goat.py ingest /path/to/staging/
 
   # Dry run (no Supabase writes, no embeddings — just extract + manifest)
   python pdf_goat.py /path/to/doc.pdf --dry-run
@@ -55,16 +58,24 @@ from typing import Any
 # ---------------------------------------------------------------------------
 # Fix PATH for Homebrew on macOS (poppler, tesseract)
 # ---------------------------------------------------------------------------
-if sys.platform == "darwin":
-    os.environ.setdefault(
-        "PATH",
-        "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + os.environ.get("PATH", ""),
-    )
+def _fix_macos_path() -> None:
+    if sys.platform == "darwin":
+        _bin = "/opt/homebrew/bin"
+        if _bin not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = _bin + ":" + os.environ.get("PATH", "")
+
+
+_fix_macos_path()
 
 # Avoid PIL picking up wrong Python version
 sys.path = [p for p in sys.path if "python3.13" not in p]
 
+# Docling is the primary extraction engine (replaces pdfplumber for text + tables).
+# pdfplumber is retained as a last-resort fallback if Docling fails on a document.
 import pdfplumber
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.document_converter import DocumentConverter, PdfFormatOption
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -82,7 +93,7 @@ from config import (
     EMBEDDING_MODEL,
     MAX_RETRIES,
     RETRY_BASE_WAIT,
-    IMPORT_BATCH_VERSION,
+    SAILING_EMBED_VERSION,
 )
 
 # ---------------------------------------------------------------------------
@@ -110,6 +121,8 @@ SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 # Constants
 # ---------------------------------------------------------------------------
 MANIFEST_PATH = SCRIPT_DIR.parent / "audits" / "pdf_goat_manifest.csv"
+SIDECAR_MANIFEST_SUFFIX = ".manifest.json"
+SIDECAR_CHUNKS_SUFFIX = ".chunks.jsonl"
 MANIFEST_FIELDS = [
     "sha256", "filename", "path", "page_count", "total_text_chars",
     "vision_pages", "chunks_produced", "embedded_at", "chunk_type",
@@ -117,13 +130,19 @@ MANIFEST_FIELDS = [
     "pdf_goat_version", "error",
 ]
 
-PDF_GOAT_VERSION = "1.0.0"  # bump on any pipeline logic change
+PDF_GOAT_VERSION = "2.0.3"  # 2.0.3: safe stale-row ordering (upsert-first), __docling__ sentinel removed, Supabase client singleton, n_pages undercount fix, vp_raw clarity, chunks_produced safety, merged_text dead slot removed, _fix_macos_path()
 
 VISION_MODEL = "claude-sonnet-4-20250514"
 VISION_MAX_TOKENS = 4096
 
 # Named prompt templates for vision extraction
 VISION_PROMPTS: dict[str, str] = {
+    "ussailing_ar_metrics": (
+        "This table has EXACTLY 8 columns: "
+        "JAN · CANCELLED · FEB · CANCELLED · YTD · # to meet goal · 2026 GOAL · % complete. "
+        "Extract every row preserving all 8 columns. Use — for blank cells. "
+        "Output as a markdown table."
+    ),
     "ar_metrics_8col": (
         "This table has EXACTLY 8 columns: "
         "JAN · CANCELLED · FEB · CANCELLED · YTD · # to meet goal · 2026 GOAL · % complete. "
@@ -174,6 +193,18 @@ def append_manifest(row: dict) -> None:
         w.writerow(row)
 
 
+def sidecar_manifest_path(pdf_path: Path) -> Path:
+    """Return the sibling JSON manifest path for a PDF."""
+    real_path = pdf_path.resolve()
+    return real_path.with_name(real_path.name + SIDECAR_MANIFEST_SUFFIX)
+
+
+def sidecar_chunks_path(pdf_path: Path) -> Path:
+    """Return the sibling chunk JSONL path for a PDF."""
+    real_path = pdf_path.resolve()
+    return real_path.with_name(real_path.name + SIDECAR_CHUNKS_SUFFIX)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Step 2-4: Text Extraction + Page Classification + Tables
 # ═══════════════════════════════════════════════════════════════════════════
@@ -182,7 +213,7 @@ class PageInfo:
     """Holds extraction results for a single PDF page."""
     __slots__ = (
         "page_num", "text", "images", "tables", "classification",
-        "vision_text", "merged_text",
+        "vision_text", "docling_table_items",
     )
 
     def __init__(self, page_num: int):
@@ -190,16 +221,152 @@ class PageInfo:
         self.text: str = ""
         self.images: list = []
         self.tables: list[list[list[str]]] = []
+        self.docling_table_items: list = []  # list of (TableItem, DoclingDocument)
         self.classification: str = ""  # text_only|text_with_images|image_only|empty
         self.vision_text: str = ""
-        self.merged_text: str = ""
+
+
+# Module-level Docling converter (lazy-initialised once, reused across documents).
+_DOCLING_CONVERTER: DocumentConverter | None = None
+
+# Module-level Supabase client (lazy-initialised once, reused across documents).
+_SUPABASE_CLIENT: Any = None
+
+
+def _get_supabase_client() -> Any:
+    """Return (and lazily create) the shared Supabase client."""
+    global _SUPABASE_CLIENT
+    if _SUPABASE_CLIENT is None:
+        from supabase import create_client
+        _SUPABASE_CLIENT = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    return _SUPABASE_CLIENT
+
+
+def _get_docling_converter() -> DocumentConverter:
+    """Return (and lazily create) the shared DocumentConverter."""
+    global _DOCLING_CONVERTER
+    if _DOCLING_CONVERTER is None:
+        pipeline_options = PdfPipelineOptions()
+        pipeline_options.do_ocr = True            # OCR for image-only / scanned pages
+        pipeline_options.do_table_structure = True  # TableFormer for structured tables
+        _DOCLING_CONVERTER = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+            }
+        )
+    return _DOCLING_CONVERTER
 
 
 def extract_pages(pdf_path: Path) -> list[PageInfo]:
-    """Extract text, images, tables from every page. Classify each page."""
+    """Extract text, images, tables from every page using Docling.
+
+    Docling (TableFormer) is the primary engine.  pdfplumber is the fallback
+    if Docling raises an exception on a specific document.
+    Page classification mirrors the original schema:
+        text_only | text_with_tables | text_with_images | image_only | empty
+    """
+    try:
+        return _extract_pages_docling(pdf_path)
+    except Exception as exc:
+        log.warning(
+            "Docling extraction failed for %s (%s) — falling back to pdfplumber",
+            pdf_path.name, exc,
+        )
+        return _extract_pages_pdfplumber_fallback(pdf_path)
+
+
+def _extract_pages_docling(pdf_path: Path) -> list[PageInfo]:
+    """Primary extraction path: Docling DocumentConverter."""
+    converter = _get_docling_converter()
+    result = converter.convert(str(pdf_path))
+    doc = result.document
+
+    # Build a page_num → PageInfo map.
+    page_map: dict[int, PageInfo] = {}
+    n_pages = len(doc.pages) if hasattr(doc, "pages") else 1
+
+    for pnum in range(1, n_pages + 1):
+        page_map[pnum] = PageInfo(page_num=pnum)
+
+    # ── Text items → page text ─────────────────────────────────────────────
+    if hasattr(doc, "texts"):
+        for item in doc.texts:
+            pnum = _docling_item_page(item)
+            if pnum not in page_map:
+                page_map[pnum] = PageInfo(page_num=pnum)
+            page_map[pnum].text += (" " + item.text if page_map[pnum].text else item.text)
+
+    # ── Table items → page tables (stored as markdown + carry TableItem+doc) ─
+    if hasattr(doc, "tables"):
+        for tbl_item in doc.tables:
+            pnum = _docling_item_page(tbl_item)
+            if pnum not in page_map:
+                page_map[pnum] = PageInfo(page_num=pnum)
+            # Store (TableItem, doc) so content_blocks can call export_to_markdown(doc)
+            page_map[pnum].docling_table_items.append((tbl_item, doc))
+
+    # ── Page classification ────────────────────────────────────────────────
+    # Ensure n_pages reflects the actual highest page number seen in the document
+    if page_map:
+        n_pages = max(n_pages, max(page_map.keys()))
+
+    try:
+        file_bytes = pdf_path.stat().st_size
+    except OSError:
+        file_bytes = 0
+    bytes_per_page_avg = file_bytes / max(n_pages, 1)
+
+    pages = [page_map[k] for k in sorted(page_map)]
+    for pi in pages:
+        has_text = len(pi.text.strip()) > 20
+        has_tables = bool(pi.docling_table_items)
+        if has_text and has_tables:
+            pi.classification = "text_with_tables"  # body text + Docling tables
+        elif has_text:
+            pi.classification = "text_only"
+        elif has_tables:
+            pi.classification = "text_with_tables"  # table-only pages
+        elif bytes_per_page_avg > 50_000:
+            pi.classification = "image_only"  # scanned raster page
+        else:
+            pi.classification = "empty"
+
+    return pages
+
+
+
+def _table_item_to_markdown(tbl_item: Any, doc_obj: Any) -> str:
+    """Serialize a Docling TableItem to Markdown (with fallback)."""
+    try:
+        return tbl_item.export_to_markdown(doc_obj)
+    except Exception:
+        try:
+            return tbl_item.export_to_markdown()
+        except Exception:
+            return ""
+
+
+def _docling_item_page(item: Any) -> int:
+    """Extract 1-based page number from a Docling item (best-effort)."""
+    for attr in ("page_no", "page"):
+        try:
+            value = getattr(item.prov[0], attr)
+            if isinstance(value, int) and value >= 1:
+                return value
+            if isinstance(value, str) and value.isdigit() and int(value) >= 1:
+                return int(value)
+        except (AttributeError, IndexError, TypeError):
+            pass
+    log.debug(
+        "_docling_item_page: could not determine valid page number, defaulting to 1 for item %s",
+        type(item).__name__,
+    )
+    return 1
+
+
+def _extract_pages_pdfplumber_fallback(pdf_path: Path) -> list[PageInfo]:
+    """Fallback extraction path: pdfplumber (legacy behaviour)."""
     pages: list[PageInfo] = []
-    # File-level byte-per-page estimate: reliable proxy for raster content.
-    # A scanned letter page at 200dpi is ~100-300 KB; a truly blank page is <1 KB.
     try:
         file_bytes = pdf_path.stat().st_size
     except OSError:
@@ -211,25 +378,16 @@ def extract_pages(pdf_path: Path) -> list[PageInfo]:
 
         for i, page in enumerate(pdf.pages):
             pi = PageInfo(page_num=i + 1)
-
-            # Text
             raw = page.extract_text() or ""
             pi.text = raw.strip()
-
-            # Images
             pi.images = page.images or []
-
-            # Tables
             try:
-                tbls = page.extract_tables() or []
-                pi.tables = tbls
+                pi.tables = page.extract_tables() or []
             except Exception:
                 pi.tables = []
 
-            # Classify
             has_text = len(pi.text) > 20
             has_images = len(pi.images) > 0
-
             if has_text and has_images:
                 pi.classification = "text_with_images"
             elif has_text:
@@ -237,17 +395,10 @@ def extract_pages(pdf_path: Path) -> list[PageInfo]:
             elif has_images:
                 pi.classification = "image_only"
             else:
-                # Distinguish truly-blank pages from scanned raster pages.
-                # pdfplumber can't enumerate inline images on raster page streams
-                # (the page IS the image), so those falsely show 0 images.
-                # Heuristic: if the average bytes/page is large the file almost
-                # certainly contains scanned raster data, not blank pages.
-                # Threshold: 50 KB/page — a blank page is <1 KB, scanned is >80 KB.
                 if bytes_per_page_avg > 50_000:
-                    pi.classification = "image_only"  # scanned raster page
+                    pi.classification = "image_only"
                 else:
                     pi.classification = "empty"
-
             pages.append(pi)
     return pages
 
@@ -282,7 +433,7 @@ def detect_prompt_template(filename: str, page_num: int) -> str:
 
     # Association Reports — metrics tables
     if any(kw in fn_lower for kw in ["association-report", "association_report", "-ar-"]):
-        return "ar_metrics_8col"
+        return "ussailing_ar_metrics"
 
     # 990 tax filings
     if "990" in fn_lower:
@@ -385,7 +536,7 @@ def run_vision_pass(
     """Run Claude Vision on pages that need it. Returns count of pages processed."""
     vision_pages = [
         p for p in pages
-        if p.classification == "image_only"
+        if p.classification in ("image_only", "text_with_images")
         or (p.classification == "empty" and len(p.images) > 0)
         or (vision_only and p.classification == "empty")  # scanned pages: no inline imgs
     ]
@@ -425,9 +576,18 @@ def merge_page_content(pages: list[PageInfo]) -> str:
         elif pi.text:
             page_parts.append(pi.text)
 
-        # Append table markdown if tables were detected via pdfplumber
-        if pi.tables and not pi.vision_text:
-            tbl_md = tables_to_markdown(pi.tables)
+        # Append table markdown (Docling primary, pdfplumber fallback)
+        # Always include Docling tables — vision output is additive, not a replacement.
+        if pi.docling_table_items or pi.tables:
+            if pi.docling_table_items:
+                tbl_parts = []
+                for tbl_item, doc_obj in pi.docling_table_items:
+                    md = _table_item_to_markdown(tbl_item, doc_obj)
+                    if md.strip():
+                        tbl_parts.append(md)
+                tbl_md = "\n\n".join(tbl_parts)
+            else:
+                tbl_md = tables_to_markdown(pi.tables)
             if tbl_md.strip():
                 page_parts.append(tbl_md)
 
@@ -438,17 +598,147 @@ def merge_page_content(pages: list[PageInfo]) -> str:
     return "\n".join(parts)
 
 
+def page_requires_vision(pi: PageInfo) -> bool:
+    """Determine whether a page should be routed to vision."""
+    return (
+        pi.classification in ("image_only", "text_with_images")
+        or (pi.classification == "empty" and len(pi.images) > 0)
+    )  # text_with_tables is NOT vision — Docling/TableFormer handles it
+
+
+def content_blocks_from_pages(pages: list[PageInfo], filename: str) -> list[dict[str, Any]]:
+    """Build page-scoped content blocks with explicit content_type labels."""
+    blocks: list[dict[str, Any]] = []
+    for pi in pages:
+        if pi.text.strip():
+            blocks.append({
+                "page_num": pi.page_num,
+                "content_type": "text_only",
+                "prompt_template": None,
+                "text": pi.text,
+            })
+
+        # Always preserve Docling tables — vision output is additive, not a replacement.
+        if pi.docling_table_items or pi.tables:
+            if pi.docling_table_items:
+                tbl_parts = []
+                for tbl_item, doc_obj in pi.docling_table_items:
+                    md = _table_item_to_markdown(tbl_item, doc_obj)
+                    if md.strip():
+                        tbl_parts.append(md)
+                tbl_md = "\n\n".join(tbl_parts)
+            else:
+                tbl_md = tables_to_markdown(pi.tables)
+            if tbl_md.strip():
+                blocks.append({
+                    "page_num": pi.page_num,
+                    "content_type": "table",
+                    "prompt_template": None,
+                    "text": tbl_md,
+                })
+
+        if pi.vision_text.strip():
+            template = detect_prompt_template(filename, pi.page_num)
+            blocks.append({
+                "page_num": pi.page_num,
+                "content_type": "vision_table" if template == "ussailing_ar_metrics" else "vision",
+                "prompt_template": template,
+                "text": pi.vision_text,
+            })
+
+    return blocks
+
+
+def chunk_content_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Chunk page-scoped content blocks while preserving content_type metadata."""
+    chunk_records: list[dict[str, Any]] = []
+    row_ordinal = 0
+
+    for block in blocks:
+        cleaned = preprocess_text(
+            block["text"],
+            is_ocr=block["content_type"].startswith("vision"),
+        )
+        if not cleaned:
+            continue
+
+        pieces = chunk_text(cleaned, chunk_size=CHUNK_CHARS, overlap=CHUNK_OVERLAP)
+        if not pieces:
+            pieces = [cleaned]
+
+        for piece in pieces:
+            chunk_records.append({
+                "row_ordinal": row_ordinal,
+                "page_num": block["page_num"],
+                "content_type": block["content_type"],
+                "prompt_template": block["prompt_template"],
+                "chunk_text": piece,
+                "char_count": len(piece),
+            })
+            row_ordinal += 1
+
+    return chunk_records
+
+
+def write_sidecar_outputs(
+    pdf_path: Path,
+    *,
+    sha256: str,
+    pages: list[PageInfo],
+    chunk_records: list[dict[str, Any]],
+    chunk_type: str,
+    vision_templates_used: set[str],
+    embedded_at: str,
+) -> None:
+    """Write sibling manifest JSON and chunk JSONL files beside the PDF."""
+    manifest_path = sidecar_manifest_path(pdf_path)
+    chunks_path = sidecar_chunks_path(pdf_path)
+
+    page_rows = []
+    for pi in pages:
+        prompt_template = detect_prompt_template(pdf_path.name, pi.page_num) if page_requires_vision(pi) else None
+        page_rows.append({
+            "page_num": pi.page_num,
+            "classification": pi.classification,
+            "vision_required": page_requires_vision(pi),
+            "prompt_template": prompt_template,
+            "text_chars": len(pi.text),
+            "table_count": len(pi.tables),
+            "vision_text_chars": len(pi.vision_text),
+        })
+
+    chunk_summary: dict[str, int] = {}
+    for rec in chunk_records:
+        chunk_summary[rec["content_type"]] = chunk_summary.get(rec["content_type"], 0) + 1
+
+    manifest_payload = {
+        "sha256": sha256,
+        "filename": pdf_path.name,
+        "path": str(pdf_path),
+        "page_count": len(pages),
+        "vision_pages": [p["page_num"] for p in page_rows if p["vision_required"]],
+        "vision_prompt_templates": sorted(vision_templates_used),
+        "chunk_type": chunk_type,
+        "chunks_total": len(chunk_records),
+        "chunk_summary": chunk_summary,
+        "embedding_model": f"{EMBEDDING_MODEL}@{EMBED_DIMENSIONS}d" if embedded_at else "",
+        "chunker_version": CHUNKER_VERSION,
+        "pdf_goat_version": PDF_GOAT_VERSION,
+        "processed_at": embedded_at or datetime.now(timezone.utc).isoformat(),
+        "pages": page_rows,
+        "chunks_file": chunks_path.name,
+        "supabase_content_type_supported": True,  # migration 161 — column is live
+    }
+
+    manifest_path.write_text(json.dumps(manifest_payload, indent=2), encoding="utf-8")
+    with chunks_path.open("w", encoding="utf-8") as f:
+        for rec in chunk_records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Step 8-9: Preprocess + Chunk
 # ═══════════════════════════════════════════════════════════════════════════
-
-def preprocess_and_chunk(full_text: str) -> list[str]:
-    """Clean text and split into chunks."""
-    cleaned = preprocess_text(full_text, is_ocr=False)
-    if not cleaned:
-        return []
-    return chunk_text(cleaned, chunk_size=CHUNK_CHARS, overlap=CHUNK_OVERLAP)
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Step 10: Embed
@@ -496,7 +786,7 @@ def embed_chunks(chunks: list[str]) -> list[list[float]]:
 # Step 11: Upsert to Supabase
 # ═══════════════════════════════════════════════════════════════════════════
 
-def supabase_row_count(sha256: str, table: str = "document_embeddings") -> int:
+def supabase_row_count(sha256: str, table: str = "sailing_embeddings") -> int:
     """Query actual DB row count for a sha256. Returns -1 if credentials absent."""
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         return -1
@@ -520,7 +810,7 @@ def supabase_row_count(sha256: str, table: str = "document_embeddings") -> int:
 
 def upsert_to_supabase(
     rows: list[dict[str, Any]],
-    table: str = "document_embeddings",
+    table: str = "sailing_embeddings",
 ) -> int:
     """Upsert rows to Supabase. Returns count of rows written.
 
@@ -531,9 +821,7 @@ def upsert_to_supabase(
         log.warning("No Supabase credentials — skipping upsert")
         return 0
 
-    from supabase import create_client
-
-    client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    client = _get_supabase_client()
 
     # Batch upsert in groups of 500
     written = 0
@@ -562,12 +850,17 @@ def build_supabase_rows(
     embeddings: list[list[float]],
     chunk_type: str,
     corpus: list[str] | None = None,
+    chunk_records: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Build row dicts for a configurable Supabase embeddings table."""
+    """Build row dicts for Supabase sailing_embeddings."""
     now = datetime.now(timezone.utc).isoformat()
-    corpus_tag = corpus if corpus is not None else ["public_docs"]
+    corpus_tag = corpus if corpus is not None else ["ussailing"]
     rows = []
     for ordinal, (chunk, emb) in enumerate(zip(chunks, embeddings)):
+        # Resolve content_type for this chunk from chunk_records when available
+        ct = None
+        if chunk_records and ordinal < len(chunk_records):
+            ct = chunk_records[ordinal].get("content_type")
         rows.append({
             "object_id": sha256,
             "filer_name": os.path.splitext(filename)[0],
@@ -577,10 +870,11 @@ def build_supabase_rows(
             "embedding": emb if emb else None,
             "embedding_model": EMBEDDING_MODEL,
             "embedded_at": now,
-            "import_batch": IMPORT_BATCH_VERSION,
+            "import_batch": SAILING_EMBED_VERSION,
             "source_xml_sha256": sha256,
             "source_pdf_sha256": sha256,
             "corpus": corpus_tag,
+            "content_type": ct,
         })
     return rows
 
@@ -589,13 +883,13 @@ def build_supabase_rows(
 # Step 12: Classify chunk_type from filename
 # ═══════════════════════════════════════════════════════════════════════════
 
-def classify_chunk_type(filename: str, chunk_prefix: str = "public") -> str:
+def classify_chunk_type(filename: str, chunk_prefix: str = "ussailing") -> str:
     """Infer chunk_type from filename patterns. chunk_prefix overrides the org prefix."""
     fn = filename.lower()
     p = chunk_prefix
 
     if "990" in fn:
-        if "foundation" in fn:
+        if "foundation" in fn or "ussf" in fn:
             return f"{p}_tier1_foundation"
         return f"{p}_tier1_990_tax"
 
@@ -638,9 +932,8 @@ def classify_chunk_type(filename: str, chunk_prefix: str = "public") -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 # Module-level corpus/prefix globals (overridden by CLI args in main())
 # ═══════════════════════════════════════════════════════════════════════════
-_CORPUS: list[str] = ["public_docs"]
-_CHUNK_PREFIX: str = "public"
-_TABLE: str = "document_embeddings"
+_CORPUS: list[str] = ["ussailing"]
+_CHUNK_PREFIX: str = "ussailing"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -666,8 +959,15 @@ def process_pdf(
         manifest = load_manifest()
         if sha in manifest and not manifest[sha].get("error"):
             mrow = manifest[sha]
-            chunks_produced = int(mrow.get("chunks_produced") or 0)
-            vp_raw = mrow.get("vision_pages") or 0; vision_pages = len(str(vp_raw).split(",")) if vp_raw and str(vp_raw).strip() not in ("0", "") else int(vp_raw or 0)
+            try:
+                chunks_produced = int(mrow.get("chunks_produced") or 0)
+            except (TypeError, ValueError):
+                chunks_produced = 0
+            vp_raw = mrow.get("vision_pages") or ""
+            if vp_raw and str(vp_raw).strip() not in ("", "0"):
+                vision_pages = len(str(vp_raw).split(","))
+            else:
+                vision_pages = 0
             # Ghost guard 1: vision doc that produced 0 chunks → reprocess.
             if vision_pages > 0 and chunks_produced == 0:
                 log.info(
@@ -677,7 +977,7 @@ def process_pdf(
             else:
                 # Ghost guard 2: manifest claims N chunks but DB has fewer.
                 # This catches null-byte / upsert failures that logged "success".
-                db_count = supabase_row_count(sha, table=_TABLE)
+                db_count = supabase_row_count(sha)
                 if db_count >= 0 and db_count < chunks_produced:
                     log.warning(
                         "  ⚠  Manifest=%d chunks but DB=%d rows for SHA256=%s… — re-embedding.",
@@ -700,17 +1000,16 @@ def process_pdf(
         return row
 
     total_text = sum(len(p.text) for p in pages)
-    vision_needed = [p for p in pages if p.classification == "image_only"]
+    vision_needed = [p for p in pages if page_requires_vision(p)]
     log.info(
-        "  %d pages | %d chars text | %d image-only pages",
+        "  %d pages | %d chars text | %d vision-eligible pages",
         len(pages), total_text, len(vision_needed),
     )
 
     # Step 5-6: Vision
-    vision_count = 0
     empty_pages = [p for p in pages if p.classification == "empty"]
     if not no_vision and (vision_needed or (vision_only and empty_pages)):
-        vision_count = run_vision_pass(pdf_path, pages, vision_only=vision_only)
+        run_vision_pass(pdf_path, pages, vision_only=vision_only)
 
     # Step 7: Merge
     full_text = merge_page_content(pages)
@@ -718,22 +1017,46 @@ def process_pdf(
         log.warning("  ⚠ No content extracted")
 
     # Step 8-9: Chunk
-    chunks = preprocess_and_chunk(full_text)
+    content_blocks = content_blocks_from_pages(pages, filename)
+    chunk_records = chunk_content_blocks(content_blocks)
+    chunks = [rec["chunk_text"] for rec in chunk_records]
     log.info("  %d chunks produced", len(chunks))
 
     # Classify
     chunk_type = classify_chunk_type(filename, chunk_prefix=_CHUNK_PREFIX)
 
     # Step 10-11: Embed + Upsert (skip in dry_run)
+    embedded_at = ""
     if dry_run:
         log.info("  🏜  Dry run — skipping embed + upsert")
         embeddings = []
     else:
         embeddings = embed_chunks(chunks)
         if embeddings:
-            sb_rows = build_supabase_rows(filename, sha, chunks, embeddings, chunk_type, corpus=_CORPUS)
-            written = upsert_to_supabase(sb_rows, table=_TABLE)
+            if len(embeddings) != len(chunks):
+                raise RuntimeError(
+                    f"Embedding count mismatch: {len(embeddings)} embeddings for {len(chunks)} chunks"
+                )
+            sb_rows = build_supabase_rows(filename, sha, chunks, embeddings, chunk_type, corpus=_CORPUS, chunk_records=chunk_records)
+            written = upsert_to_supabase(sb_rows)
+            if force:
+                # Safe stale-row prune: data is already written above.
+                # Delete only rows whose ordinal exceeds the new max — never touches current rows.
+                max_ordinal = len(sb_rows) - 1
+                try:
+                    _get_supabase_client().table(
+                        "sailing_embeddings"
+                    ).delete().eq("object_id", sha).eq("chunk_type", chunk_type).gt(
+                        "row_ordinal", max_ordinal
+                    ).execute()
+                    log.debug(
+                        "  Pruned stale rows (ordinal > %d) for %s / %s",
+                        max_ordinal, sha[:8], chunk_type,
+                    )
+                except Exception as _del_exc:
+                    log.warning("  Could not prune stale rows: %s", _del_exc)
             log.info("  ✓ Upserted %d rows to Supabase", written)
+            embedded_at = datetime.now(timezone.utc).isoformat()
 
     # Step 12: Manifest
     vision_page_nums = ",".join(
@@ -746,6 +1069,16 @@ def process_pdf(
             if p.vision_text:
                 vision_templates_used.add(detect_prompt_template(filename, p.page_num))
 
+    write_sidecar_outputs(
+        pdf_path,
+        sha256=sha,
+        pages=pages,
+        chunk_records=chunk_records,
+        chunk_type=chunk_type,
+        vision_templates_used=vision_templates_used,
+        embedded_at=embedded_at,
+    )
+
     row = {
         "sha256": sha,
         "filename": filename,
@@ -754,7 +1087,7 @@ def process_pdf(
         "total_text_chars": str(total_text),
         "vision_pages": vision_page_nums,
         "chunks_produced": str(len(chunks)),
-        "embedded_at": datetime.now(timezone.utc).isoformat() if not dry_run else "",
+        "embedded_at": embedded_at if not dry_run else "",
         "chunk_type": chunk_type,
         "embedding_model": f"{EMBEDDING_MODEL}@{EMBED_DIMENSIONS}d" if not dry_run else "",
         "chunker_version": CHUNKER_VERSION,
@@ -771,38 +1104,40 @@ def main():
     parser = argparse.ArgumentParser(
         description="pdf_goat — Canonical PDF processor for Harbor Ingest",
     )
-    parser.add_argument("path", type=Path, help="PDF file or directory of PDFs")
+    parser.add_argument("command_or_path", help="PDF path, directory path, or the literal command 'ingest'")
+    parser.add_argument("maybe_path", nargs="?", help="Path used when command_or_path is 'ingest'")
     parser.add_argument("--dry-run", action="store_true", help="Extract only, no embed/upsert")
     parser.add_argument("--force", action="store_true", help="Reprocess even if in manifest")
     parser.add_argument("--no-vision", action="store_true", help="Skip vision extraction")
     parser.add_argument("--vision-only", action="store_true", help="Only process image-only pages")
     parser.add_argument(
         "--corpus", nargs="+", default=None,
-        help="Corpus tag(s) for output rows (default: ['public_docs'])",
+        help="Corpus tag(s) for sailing_embeddings rows (default: ['ussailing'])",
     )
     parser.add_argument(
         "--chunk-prefix", default=None,
-        help="Prefix for chunk_type classification (default: 'public')",
-    )
-    parser.add_argument(
-        "--table", default="document_embeddings",
-        help="Supabase table name for embedding rows (default: 'document_embeddings')",
+        help="Prefix for chunk_type classification (default: 'ussailing')",
     )
     args = parser.parse_args()
 
     # Set module-level globals so process_pdf() picks them up
-    global _CORPUS, _CHUNK_PREFIX, _TABLE
-    _CORPUS = args.corpus if args.corpus else ["public_docs"]
-    _CHUNK_PREFIX = args.chunk_prefix if args.chunk_prefix else "public"
-    _TABLE = args.table
-    log.info("Corpus tags: %s | Chunk prefix: %s | Table: %s", _CORPUS, _CHUNK_PREFIX, _TABLE)
+    global _CORPUS, _CHUNK_PREFIX
+    _CORPUS = args.corpus if args.corpus else ["ussailing"]
+    _CHUNK_PREFIX = args.chunk_prefix if args.chunk_prefix else "ussailing"
+    log.info("Corpus tags: %s | Chunk prefix: %s", _CORPUS, _CHUNK_PREFIX)
 
-    target = args.path.resolve()
+    if args.command_or_path == "ingest":
+        if not args.maybe_path:
+            log.error("Missing path for ingest command")
+            sys.exit(1)
+        target = Path(args.maybe_path).resolve()
+    else:
+        target = Path(args.command_or_path).resolve()
 
     if target.is_file() and target.suffix.lower() == ".pdf":
         pdf_files = [target]
     elif target.is_dir():
-        pdf_files = sorted(target.glob("*.pdf"))
+        pdf_files = sorted(target.rglob("*.pdf"))
         log.info("Found %d PDFs in %s", len(pdf_files), target)
     else:
         log.error("Not a PDF file or directory: %s", target)
